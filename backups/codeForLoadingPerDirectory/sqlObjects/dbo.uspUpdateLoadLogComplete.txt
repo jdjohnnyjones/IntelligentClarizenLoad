@@ -1,0 +1,19 @@
+USE [SamtecDW-Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspUpdateLoadLogComplete]    Script Date: 1/18/2017 12:57:47 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROC [dbo].[uspUpdateLoadLogComplete] @loadId [uniqueidentifier],@loadEndDate [datetime],@runResult [bit],@loadMessage [varchar](8000) AS
+
+if @loadMessage = ''
+begin
+	set @loadMessage = null
+end
+
+update dbo.LoadLog
+set		LoadEndDate = @loadEndDate
+		, RunResult = @runResult
+		, LoadMessage = @loadMessage
+where	LoadId = @loadId

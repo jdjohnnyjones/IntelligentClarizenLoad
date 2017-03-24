@@ -1,0 +1,300 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Azure.Management.DataFactories.Models;
+using Microsoft.Azure.Management.DataFactories.Runtime;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
+using System.IO;
+using System.Data.SqlClient;
+
+namespace IntelligentClarizenLoad
+{
+    class Program
+    {
+        static string sqlConnString =
+                "Server=tcp:samtec-dw-dev-sqlserver.database.windows.net,1433;Initial Catalog=SamtecDW-Dev;Persist Security Info=False;User ID=johnnyj;Password=Awdy)(090);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=300;";
+
+        static void Main(string[] args)
+        {
+            var storageConnString = "DefaultEndpointsProtocol=https;AccountName=samtecbisource;AccountKey=W5IjLhzBd+alGIO55QDAgdDW/FxVZFg5XnubDViadnjYYy5hsyiswKhg/L8fU+Vxf3F3d1Z+vx2fkWZdPLUeWg==";
+            int isProcessed;
+            string containerName = "clarizendw";
+            string blobPrefix = "daily";
+            //string blobCountAsString;
+            int loadStatus;
+
+            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(storageConnString);
+            CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
+
+            CloudBlobContainer blobContainer = blobClient.GetContainerReference(containerName);
+
+            // list of all blobs
+            Dictionary<string, DateTimeOffset?> blobList = new Dictionary<string, DateTimeOffset?>();
+
+            foreach (var item in blobContainer.ListBlobs(blobPrefix, useFlatBlobListing: true))
+            {
+                CloudBlockBlob blob = (CloudBlockBlob)item;
+                blobList.Add(blob.Name, blob.Properties.LastModified);
+            }
+
+            // process unprocessed blobs
+            foreach (var item in blobList.OrderBy(pair => pair.Value)) // order by last modified date
+            {
+                CloudBlockBlob sourceBlob = blobContainer.GetBlockBlobReference(item.Key);
+                isProcessed = GetProcessedBlob(sourceBlob);
+
+                if (isProcessed == 1) // not processed
+                {
+                    // insert record that load is starting for this blob
+                    string loadId = UpdateLoadLog(ParseBlobUri(sourceBlob.Uri, "table").Trim('/'), sourceBlob.Name);
+
+                    // replace any back-to-back double quotes in text
+                    ProcessText(sourceBlob);
+
+                    // load table into warehouse
+                    loadStatus = SqlBuildTable(sourceBlob, sourceBlob.Name, loadId);
+
+                    // set blob as processed if loaded successfully
+                    if (loadStatus == 0)
+                    {
+                        SetProcessedBlob(sourceBlob);
+                        UpdateLoadLog(loadId, 0);
+                    }
+                        
+                }
+            }
+        }
+
+        public static int ProcessText(CloudBlockBlob blob)
+        {
+            string oldContent = "";
+            string newContent = "";
+
+            // read contents of blob
+            using (StreamReader readStream = new StreamReader(blob.OpenRead()))
+                oldContent = readStream.ReadToEnd();
+
+            // if blob contains "" in any lines, replace with "
+            if (oldContent.Contains("\"\""))
+            {
+                newContent = oldContent.Replace("\"\"", "\"");
+
+                // upload altered blob
+                using (StreamWriter writeStream = new StreamWriter(blob.OpenWrite()))
+                {
+                    writeStream.Write(newContent);
+                }
+            }
+
+            return 0;
+        }
+
+        public static int GetProcessedBlob(CloudBlockBlob blob)
+        {
+            string blobName = blob.Name;
+            int isProcessed = 0;
+
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                // add try/catch
+                sqlCon.Open();
+                SqlCommand command = new SqlCommand("uspGetProcessedBlob", sqlCon);
+                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.Parameters.Add(new SqlParameter("@blobName", blobName));
+                command.Parameters.Add(new SqlParameter("@processed", isProcessed)).Direction = System.Data.ParameterDirection.Output;
+                command.ExecuteNonQuery();
+                isProcessed = Convert.ToInt32(command.Parameters["@processed"].Value.ToString());
+            }
+
+            return isProcessed;
+        }
+
+        public static int SetProcessedBlob(CloudBlockBlob blob)
+        {
+            string blobName = blob.Name;
+            int isProcessed = 0;
+
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                // add try/catch
+                sqlCon.Open();
+                SqlCommand command = new SqlCommand("uspSetProcessedBlob", sqlCon);
+                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.Parameters.Add(new SqlParameter("@blobName", blobName));
+                command.Parameters.Add(new SqlParameter("@processed", isProcessed)).Direction = System.Data.ParameterDirection.Output;
+                command.ExecuteNonQuery();
+                isProcessed = Convert.ToInt32(command.Parameters["@processed"].Value.ToString());
+            }
+
+            return isProcessed;
+
+        }
+
+        public static int SqlBuildTable(CloudBlockBlob blob, string blobName, string loadId)
+        {
+            int result = 0;
+
+            // gather the table name
+            string tableName = ParseBlobUri(blob.Uri, "table").Trim('/');
+
+            using (StreamReader reader = new StreamReader(blob.OpenRead()))
+            {
+                // read and process first line of blob for column names
+                string columns = ProcessColumns(reader.ReadLine(), tableName);
+                // call proc to build table
+                result = LoadTable(tableName, columns, blobName, loadId);
+            }
+
+            return result;
+        }
+
+        public static int LoadTable(string tableName, string columns, string blobName, string loadId)
+        {
+            int result;
+
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                // add try/catch
+                try
+                {
+                    sqlCon.Open();
+                    SqlCommand command = new SqlCommand("uspLoadTable", sqlCon);
+                    command.CommandType = System.Data.CommandType.StoredProcedure;
+                    command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                    command.Parameters.Add(new SqlParameter("@columns", columns));
+                    command.Parameters.Add(new SqlParameter("@blobName", blobName));
+                    command.CommandTimeout = 180;
+                    command.ExecuteNonQuery();
+
+                    result = 0;
+                }
+                catch (Exception ex)
+                {
+                    // update load load with error
+                    UpdateLoadLog(loadId, 1, ex.Message);
+                    result = 1;
+                }
+                
+            }
+
+            return result;
+        }
+
+        public static string ProcessColumns(string columns, string tableName)
+        {
+            IList<KeyValuePair<string, string>> dataList = GetColumnsAndDataTypes(tableName);
+
+            string formattedColumns = "";
+            string[] columnArray = columns.Split('|');
+            string dataType;
+            string alteredColumn;
+
+            foreach (string column in columnArray)
+            {
+                dataType = dataList.Where(k => k.Key == column).Select(v => v.Value).ToList().DefaultIfEmpty("varchar(200)").First();
+                alteredColumn = ", [" + column + "] " + dataType;
+                columnArray.SetValue(alteredColumn, Array.IndexOf(columnArray, column));
+                formattedColumns += alteredColumn;
+            }
+
+            // remove the first comma
+            formattedColumns = formattedColumns.Remove(0, 2);
+
+            return formattedColumns;
+        }
+
+        public static string ParseBlobUri(Uri blobUri, string requestedSegment)
+        {
+            // gather uri segments
+            string uriSegment;
+
+            if (requestedSegment == "daily")
+                uriSegment = blobUri.Segments.ElementAt(2);
+            else if (requestedSegment == "date")
+                uriSegment = blobUri.Segments.ElementAt(3);
+            else if (requestedSegment == "table")
+                uriSegment = blobUri.Segments.ElementAt(4);
+            else if (requestedSegment == "name")
+                uriSegment = blobUri.Segments.ElementAt(5);
+            else if (requestedSegment == "virtualDirectory")
+                uriSegment = blobUri.Segments.ElementAt(2) + blobUri.Segments.ElementAt(3) + blobUri.Segments.ElementAt(4);
+            else
+                uriSegment = "";
+
+            return uriSegment;    
+        }
+
+        public static string UpdateLoadLog(string tableName, string blobName)
+        {
+            var loadId = Guid.NewGuid().ToString();
+            DateTime loadStartDate = DateTime.Now;
+
+            // starting a new load
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                sqlCon.Open();
+                SqlCommand command = new SqlCommand("uspUpdateLoadLogStart", sqlCon);
+                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.Parameters.Add(new SqlParameter("@loadId", loadId));
+                command.Parameters.Add(new SqlParameter("@loadStartDate", loadStartDate));
+                command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                command.Parameters.Add(new SqlParameter("@blobName", blobName));
+                command.ExecuteNonQuery();
+            }
+
+            return loadId;
+        }
+
+        public static void UpdateLoadLog(string loadId, int runResult, string loadMessage = "")
+        {
+            DateTime loadEndDate = DateTime.Now;
+
+            // updating for completion
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                sqlCon.Open();
+                SqlCommand command = new SqlCommand("uspUpdateLoadLogComplete", sqlCon);
+                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.Parameters.Add(new SqlParameter("@loadId", loadId));
+                command.Parameters.Add(new SqlParameter("@loadEndDate", loadEndDate));
+                command.Parameters.Add(new SqlParameter("@runResult", runResult));
+                command.Parameters.Add(new SqlParameter("@loadMessage", loadMessage));
+                command.ExecuteNonQuery();
+            }
+
+        }
+
+        public static IList<KeyValuePair<string, string>> GetColumnsAndDataTypes(string tableName)
+        {
+            // pull down columns and data types from sql
+            IList<KeyValuePair<string, string>> dataList = new List<KeyValuePair<string, string>>();
+
+            using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
+            {
+                sqlCon.Open();
+                string commandString = @"select ColumnName, SqlDataType
+                                        from dbo.DataDictionary
+                                        where TableName = @tableName";
+                SqlCommand command = new SqlCommand(commandString, sqlCon);
+                command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                command.CommandType = System.Data.CommandType.Text;
+
+                SqlDataReader sr = command.ExecuteReader();
+
+                if (sr.HasRows)
+                {
+                    while (sr.Read())
+                    {
+                        dataList.Add(new KeyValuePair<string, string>(sr["ColumnName"].ToString(), sr["SqlDataType"].ToString()));
+                    }
+                }
+
+            }
+
+            return dataList;
+        }
+    }
+}

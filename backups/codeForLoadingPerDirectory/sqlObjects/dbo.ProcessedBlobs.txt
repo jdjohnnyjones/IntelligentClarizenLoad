@@ -1,0 +1,24 @@
+USE [SamtecDW-Dev]
+GO
+
+/****** Object:  Table [dbo].[ProcessedBlobs]    Script Date: 1/18/2017 12:56:46 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[ProcessedBlobs]
+(
+	[BlobName] [varchar](200) NOT NULL,
+	[DateProcessed] [datetime2](7) NOT NULL
+)
+WITH
+(
+	DISTRIBUTION = HASH ( [BlobName] ),
+	CLUSTERED COLUMNSTORE INDEX
+)
+
+GO
+
+

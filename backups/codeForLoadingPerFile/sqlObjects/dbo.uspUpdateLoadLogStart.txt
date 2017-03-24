@@ -1,0 +1,13 @@
+USE [SamtecDW-Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspUpdateLoadLogStart]    Script Date: 1/19/2017 8:42:35 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROC [dbo].[uspUpdateLoadLogStart] @loadId [uniqueidentifier],@loadStartDate [datetime],@tableName [varchar](500),@blobName [varchar](500) AS
+
+insert dbo.LoadLog
+(LoadId, LoadStartDate, TableName, BlobName)
+values
+(@loadId, @loadStartDate, @tableName, @blobName)

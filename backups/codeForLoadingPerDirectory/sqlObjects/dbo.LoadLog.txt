@@ -1,0 +1,29 @@
+USE [SamtecDW-Dev]
+GO
+
+/****** Object:  Table [dbo].[LoadLog]    Script Date: 1/18/2017 12:56:14 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[LoadLog]
+(
+	[LoadId] [uniqueidentifier] NULL,
+	[LoadStartDate] [datetime] NULL,
+	[LoadEndDate] [datetime] NULL,
+	[TableName] [varchar](500) NULL,
+	[BlobName] [varchar](500) NULL,
+	[RunResult] [bit] NULL,
+	[LoadMessage] [varchar](8000) NULL
+)
+WITH
+(
+	DISTRIBUTION = HASH ( [LoadStartDate] ),
+	CLUSTERED COLUMNSTORE INDEX
+)
+
+GO
+
+

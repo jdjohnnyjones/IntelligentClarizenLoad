@@ -1,0 +1,17 @@
+USE [SamtecDW-Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspGetProcessedBlob]    Script Date: 1/19/2017 8:40:48 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROC [dbo].[uspGetProcessedBlob] @blobName [varchar](200),@processed [int] OUT AS
+
+if exists (select 1 from dbo.ProcessedBlobs where BlobName = @blobName)
+begin
+	set @processed = 0 -- blob has been processed
+end
+else
+begin
+	set @processed = 1 -- blob has not been processed
+end

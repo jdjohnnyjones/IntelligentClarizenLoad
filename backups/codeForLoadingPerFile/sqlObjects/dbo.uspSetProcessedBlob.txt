@@ -1,0 +1,22 @@
+USE [SamtecDW-Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspSetProcessedBlob]    Script Date: 1/19/2017 8:41:39 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROC [dbo].[uspSetProcessedBlob] @blobName [varchar](200),@processed [int] OUT AS
+
+declare @date datetime2(7) = sysdatetime()
+
+begin try
+	insert dbo.ProcessedBlobs
+	values
+	(@blobName, @date)
+end try
+begin catch
+	set @processed = 1
+end catch
+
+set @processed = 0
+

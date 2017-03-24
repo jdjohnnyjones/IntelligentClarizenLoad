@@ -1,0 +1,274 @@
+USE [SamtecDW-Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspLoadTable]    Script Date: 1/18/2017 12:59:02 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROC [dbo].[uspLoadTable] @tableName [varchar](100),@columnList [varchar](max),@blobVirtualDirectory [varchar](200),@blobCount [varchar](3) AS
+
+		-- comes in as:	daily/2016_11_03_e99b74722c0c4dcf90e1d3b4961e9b7d/
+		-- setting to:	/daily/2016_11_03_e99b74722c0c4dcf90e1d3b4961e9b7d/Following/
+
+
+declare	@cmd						varchar(max)
+		, @externalTableLocation	varchar(200) = '/' + @blobVirtualDirectory
+		, @stagingTableName varchar(100) = 'stg_' + @tableName
+		, @physicalTableSchema varchar(20) = 'dbo'
+		, @externalTableSchema varchar(20) = 'ClarizenSource'
+		, @delimiter char(1) = '|'
+		, @idx int
+		, @slice varchar(8000)
+		, @rejectValue varchar(3) = @blobCount
+
+if object_id('tempdb..#columnMappingTable') is not null
+begin
+	drop table #columnMappingTable
+end
+if object_id('tempdb..#columnMappingTableWithTypes') is not null
+begin
+	drop table #columnMappingTableWithTypes
+end
+if object_id('tempdb..#columnDiffs') is not null
+begin
+	drop table #columnDiffs
+end
+
+-- initial to hold our columns and data types
+create table #columnMappingTable 
+(
+	Position int
+	, ColumnName varchar(100)
+	, DataType varchar(50)
+	, IsProcessed bit
+)
+
+-- table for column differences
+create table #columnDiffs
+(
+	OnlyIn varchar(8)
+	, SourceSchema varchar(100)
+	, SourceTable varchar(100)
+	, DestinationSchema varchar(100)
+	, DestinationTable varchar(100)
+	, ColumnName varchar(100)
+	, DataType varchar(100)
+)
+
+-- split @columnList into individual columns      
+set @idx = 1
+declare @increment int = 1
+
+while @idx != 0
+	begin
+		set @idx = charindex(@Delimiter, @columnList)
+		if @idx != 0
+			set @slice = left(@columnList, @idx - 1)
+		else
+			set @slice = @columnList
+
+		if(len(@slice) > 0)
+			insert into #columnMappingTable(Position, ColumnName, IsProcessed) values(@increment, @slice, 0)
+
+		set @increment = @increment + 1
+        set @columnList = right(@columnList, len(@columnList) - @idx)
+		if len(@columnList) = 0 break
+	end
+
+-- create new temp table with updated data types (adw doesn't support joins on update stmts)
+create table #columnMappingTableWithTypes
+with
+(
+	distribution = hash([Position])
+	, clustered index ([Position])
+)
+as
+select		a.Position, a.ColumnName, b.SqlDataType as DataType, a.IsProcessed
+from		#columnMappingTable a
+left join	dbo.DataDictionary b
+on			a.ColumnName = b.ColumnName
+and			b.TableName = @tableName
+
+ -- any columns left not updated with a data type are not in the data dictionary, and are probably custom columns
+ -- we will update them to varchar(500) to be safe until we have a better way of knowing this (discuss with Chad)
+ update	#columnMappingTableWithTypes
+ set	DataType = 'varchar(200)'
+ where	DataType is null
+
+-- drop the current external table if it exists
+if exists(select 1 from sys.tables where name = @tableName and is_external = 1)
+begin
+	exec('drop external table ' + @externalTableSchema + '.' + @tableName)
+end
+
+-- build query to create new external table
+set @cmd = (select 'create external table ' + @externalTableSchema + '.' + @tableName + '(')
+
+-- must loop through columns, because adw doesn't support "select @var = "
+declare @colCount int
+		, @pos int
+set @pos = 1
+set @colCount = (select count(*) from #columnMappingTableWithTypes where IsProcessed = 0)
+
+while @colCount != 0
+begin
+	set @cmd += (select case
+							when Position = 1 then '[' + ColumnName + ']'
+							else ', [' + ColumnName + ']'
+						end + ' ' + DataType
+				from	#columnMappingTableWithTypes
+				where	Position = @pos)
+
+	-- update processed flag for column
+	update	#columnMappingTableWithTypes
+	set		IsProcessed = 1
+	where	Position = @pos
+
+	-- update non-processed count
+	set @colCount = (select count(*) from #columnMappingTableWithTypes where IsProcessed = 0)
+
+	-- increment position
+	set @pos = @pos + 1
+end
+
+set @cmd += (select ')
+				with
+				(
+					location = ''' + @externalTableLocation +
+					''', data_source = SamtecBISource
+					, file_format = clarizenCsvFiles
+					, reject_type = value
+					, reject_value = ' + @rejectValue + 
+				')')
+
+-- build new external table
+exec(@cmd)	
+
+-- if the physical table does not exist, create the new table, else update the data
+if not exists(select 1 from sys.tables where name = @tableName and is_external = 0)
+begin
+	-- create physical table as select from external table
+	set @cmd = (select 'create table ' + @physicalTableSchema + '.' + @tableName + 
+					' with
+					(
+						distribution = hash([id])
+						, clustered index ([id])
+					)
+					as
+					select * from ' + @externalTableSchema + '.' + @tableName)
+
+	exec(@cmd)
+end
+else
+begin
+	-- reconcile added/dropped columns since the last load
+	insert #columnDiffs
+	-- columns that only exist in physical table
+	select	'internal' as OnlyIn
+			, @physicalTableSchema as SourceSchema
+			, @tableName as SourceTable
+			, @externalTableSchema as DestinationSchema
+			, @tableName as DestinationTable
+			, column_name as ColumnName
+			, data_type as DataType 
+	from	information_schema.columns
+	where	table_schema = @physicalTableSchema
+	and		table_name = @tableName 
+	and		column_name not in (select column_name from information_schema.columns where table_schema = @externalTableSchema and table_name = @tableName)
+	union all
+	-- columns that only exist in external table
+	select	'external' as OnlyIn
+			, @externalTableSchema as SourceSchema
+			, @tableName as SourceTable
+			, @physicalTableSchema as DestinationSchema
+			, @tableName as DestinationTable
+			, column_name as ColumnName
+			, 'varchar(500)' as DataType
+	from	information_schema.columns
+	where	table_schema = @externalTableSchema
+	and		table_name = @tableName
+	and		column_name not in (select column_name from information_schema.columns where table_schema = @physicalTableSchema and table_name = @tableName)
+
+	declare @colName varchar(100)
+			, @counter int
+
+	-- add any new columns created since last run
+	if (select count(*) from #columnDiffs where OnlyIn = 'external') > 0
+	begin
+		set @colName = (select top 1 ColumnName from #columnDiffs where OnlyIn = 'external')
+		set @counter = (select count(*) from #columnDiffs where OnlyIn = 'external')
+
+		while @counter > 0
+		begin
+			set @cmd = (select 'alter table ' + @physicalTableSchema + '.' + @tableName + ' add ' + @colName + ' ' + DataType
+						from #columnDiffs
+						where ColumnName = @colName)
+
+			exec(@cmd)
+			--select @cmd
+
+			delete from #columnDiffs
+			where ColumnName = @colName
+
+			set @counter = (select count(*) from #columnDiffs where OnlyIn = 'external')
+			set @colName = (select top 1 ColumnName from #columnDiffs where OnlyIn = 'external')
+		end
+	end
+
+	-- drop any columns deleted since the last run
+	if (select count(*) from #columnDiffs where OnlyIn = 'internal') > 0
+	begin
+		set @colName = (select top 1 ColumnName from #columnDiffs where OnlyIn = 'internal')
+		set @counter = (select count(*) from #columnDiffs where OnlyIn = 'internal')
+
+		while @counter > 0
+		begin
+			set @cmd = (select 'alter table ' + @physicalTableSchema + '.' + @tableName + ' drop column ' + @colName)
+
+			exec(@cmd)
+
+			set @counter = (select count(*) from #columnDiffs where OnlyIn = 'internal')
+			set @colName = (select top 1 ColumnName from #columnDiffs where OnlyIn = 'internal')
+		end
+	end
+
+	-- reconcile inserts, updates, and deletes
+	set @cmd = (select 'create table ' + @physicalTableSchema + '.' + @stagingTableName +
+				' with
+				(
+					distribution = hash([id])
+					, clustered index ([id])
+				)
+				as
+				select *
+				from	' + @physicalTableSchema + '.' + @tableName + 
+				' where id not in (select id from ' + @externalTableSchema + '.' + @tableName + ' where is_deleted = ''true'') -- get all current rows not being deleted
+				union all
+				select	a.*
+				from	' + @externalTableSchema + '.' + @tableName + ' a
+				left join	' + @physicalTableSchema + '.' + @tableName + ' b
+				on			a.id = b.id
+				where		b.id is null
+				and			a.is_deleted != ''true'' -- inserts
+				union all
+				select		b.*
+				from		' + @physicalTableSchema + '.' + @tableName + ' a
+				inner join	' + @externalTableSchema + '.' + @tableName + ' b
+				on			a.id = b.id
+				where		b.is_deleted != ''true'' -- updates
+
+				rename object ' + @physicalTableSchema + '.' + @tableName + ' to ' + @tableName + '_old
+				rename object ' + @physicalTableSchema + '.' + @stagingTableName + ' to ' + @tableName + 
+				' drop table ' + @tableName + '_old')
+
+	--select @cmd
+	--select * from #columnMappingTableWithTypes
+	exec(@cmd)
+end
+
+-- temp table cleanup
+drop table #columnMappingTable
+drop table #columnMappingTableWithTypes
+drop table #columnDiffs
+
+
