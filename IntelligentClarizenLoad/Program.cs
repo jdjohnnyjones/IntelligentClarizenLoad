@@ -5,6 +5,7 @@ using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using System.IO;
 using System.IO.Compression;
+using System.Data;
 using System.Data.SqlClient;
 
 namespace IntelligentClarizenLoad
@@ -240,10 +241,10 @@ namespace IntelligentClarizenLoad
             {
                 sqlCon.Open();
                 SqlCommand command = new SqlCommand("uspGetProcessReadyStatus", sqlCon);
-                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.CommandType = CommandType.StoredProcedure;
                 command.Parameters.Add(new SqlParameter("@tableName", tableName));
                 command.Parameters.Add(new SqlParameter("@blobDate", blobDate));
-                command.Parameters.Add(new SqlParameter("@readyToProcess", readyToProcess)).Direction = System.Data.ParameterDirection.Output;
+                command.Parameters.Add(new SqlParameter("@readyToProcess", readyToProcess)).Direction = ParameterDirection.Output;
                 command.ExecuteNonQuery();
                 readyToProcess = Convert.ToInt32(command.Parameters["@readyToProcess"].Value.ToString());
             }
@@ -255,6 +256,7 @@ namespace IntelligentClarizenLoad
             string blobCountAsString, string loadId, string columns, string sqlConnString)
         {
             int status = 0;
+            int physicalTableExists = 0;
             string processStep = "Load Table";
 
             try
@@ -262,14 +264,71 @@ namespace IntelligentClarizenLoad
                 using (SqlConnection sqlCon = new SqlConnection(sqlConnString))
                 {
                     sqlCon.Open();
-                    SqlCommand command = new SqlCommand("uspLoadTable", sqlCon);
-                    command.CommandType = System.Data.CommandType.StoredProcedure;
+
+                    // check table existence
+                    // call first time load proc if not
+                    // call incremental load process if so
+                    SqlCommand command = new SqlCommand("uspGetTableExists", sqlCon);
+                    command.CommandType = CommandType.StoredProcedure;
                     command.Parameters.Add(new SqlParameter("@tableName", tableName));
-                    command.Parameters.Add(new SqlParameter("@columns", columns));
-                    command.Parameters.Add(new SqlParameter("@blobDirectory", blobDirectory));
-                    command.Parameters.Add(new SqlParameter("@rejectCount", blobCountAsString));
-                    command.CommandTimeout = 1200;
+                    command.Parameters.Add(new SqlParameter("@physicalTableExists", physicalTableExists)).Direction =
+                        ParameterDirection.Output;
                     command.ExecuteNonQuery();
+                    physicalTableExists = Convert.ToInt32(command.Parameters["@physicalTableExists"].Value.ToString());
+
+                    if (physicalTableExists == 1)
+                    {
+                        // call first time load
+                        command = new SqlCommand("uspFirstTimeClarizenTableLoad", sqlCon);
+                        command.CommandType = CommandType.StoredProcedure;
+                        command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                        command.Parameters.Add(new SqlParameter("@columns", columns));
+                        command.Parameters.Add(new SqlParameter("@blobDirectory", blobDirectory));
+                        command.Parameters.Add(new SqlParameter("@rejectCount", blobCountAsString));
+                        command.ExecuteNonQuery();
+                    }
+                    else
+                    {
+                        DataTable dt = new DataTable();
+                        // build external table; return result set of new columns
+                        command = new SqlCommand("uspBuildExternalTable", sqlCon);
+                        command.CommandType = CommandType.StoredProcedure;
+                        command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                        command.Parameters.Add(new SqlParameter("@columns", columns));
+                        command.Parameters.Add(new SqlParameter("@blobDirectory", blobDirectory));
+                        command.Parameters.Add(new SqlParameter("@rejectCount", blobCountAsString));
+                        dt.Load(command.ExecuteReader());
+
+                        if(dt != null)
+                        {
+                            string columnString = "";
+                            // build and format column list for add cols proc
+                            foreach(DataRow dr in dt.Rows)
+                            {
+                                if (dr["IsExisting"].ToString() == "1")
+                                    columnString += "," + dr["ColumnName"].ToString();
+                                else
+                                    columnString += ",null as " + dr["ColumnName"].ToString();
+                            }
+
+                            // trim first comma
+                            columnString = columnString.TrimStart(new char[] { ',' });
+
+                            // call proc to add new columns to physical table
+                            command = new SqlCommand("uspAddNewColumns", sqlCon);
+                            command.CommandType = CommandType.StoredProcedure;
+                            command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                            command.Parameters.Add(new SqlParameter("@columnString", columnString));
+                            command.ExecuteNonQuery();
+                        }
+
+                        // call incremental load
+                        command = new SqlCommand("uspIncrementalClarizenTableLoad", sqlCon);
+                        command.CommandType = CommandType.StoredProcedure;
+                        command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                        command.ExecuteNonQuery();
+
+                    }
                 }
             }
             catch (Exception ex)
@@ -368,7 +427,7 @@ namespace IntelligentClarizenLoad
                 {
                     sqlCon.Open();
                     SqlCommand command = new SqlCommand("uspUpdateLoadLogStart", sqlCon);
-                    command.CommandType = System.Data.CommandType.StoredProcedure;
+                    command.CommandType = CommandType.StoredProcedure;
                     command.Parameters.Add(new SqlParameter("@loadId", loadId));
                     command.Parameters.Add(new SqlParameter("@tableName", tableName));
                     command.Parameters.Add(new SqlParameter("@blobDirectory", blobDirectory));
@@ -392,7 +451,7 @@ namespace IntelligentClarizenLoad
             {
                 sqlCon.Open();
                 SqlCommand command = new SqlCommand("uspUpdateLoadLogComplete", sqlCon);
-                command.CommandType = System.Data.CommandType.StoredProcedure;
+                command.CommandType = CommandType.StoredProcedure;
                 command.Parameters.Add(new SqlParameter("@loadId", loadId));
                 command.Parameters.Add(new SqlParameter("@runResult", runResult));
                 command.Parameters.Add(new SqlParameter("@loadMessage", loadMessage));
@@ -416,7 +475,7 @@ namespace IntelligentClarizenLoad
                                         where TableName = @tableName";
                 SqlCommand command = new SqlCommand(commandString, sqlCon);
                 command.Parameters.Add(new SqlParameter("@tableName", tableName));
-                command.CommandType = System.Data.CommandType.Text;
+                command.CommandType = CommandType.Text;
 
                 SqlDataReader sr = command.ExecuteReader();
 
