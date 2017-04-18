@@ -258,6 +258,7 @@ namespace IntelligentClarizenLoad
             int status = 0;
             int physicalTableExists = 0;
             string processStep = "Load Table";
+            int newColumnsExist = 0;
 
             try
             {
@@ -266,9 +267,7 @@ namespace IntelligentClarizenLoad
                     sqlCon.Open();
 
                     // check table existence
-                    // call first time load proc if not
-                    // call incremental load process if so
-                    SqlCommand command = new SqlCommand("uspGetTableExists", sqlCon);
+                    SqlCommand command = new SqlCommand("uspGetPhysicalTableExists", sqlCon);
                     command.CommandType = CommandType.StoredProcedure;
                     command.Parameters.Add(new SqlParameter("@tableName", tableName));
                     command.Parameters.Add(new SqlParameter("@physicalTableExists", physicalTableExists)).Direction =
@@ -276,7 +275,7 @@ namespace IntelligentClarizenLoad
                     command.ExecuteNonQuery();
                     physicalTableExists = Convert.ToInt32(command.Parameters["@physicalTableExists"].Value.ToString());
 
-                    if (physicalTableExists == 1)
+                    if (physicalTableExists == 0)
                     {
                         // call first time load
                         command = new SqlCommand("uspFirstTimeClarizenTableLoad", sqlCon);
@@ -289,26 +288,35 @@ namespace IntelligentClarizenLoad
                     }
                     else
                     {
-                        DataTable dt = new DataTable();
-                        // build external table; return result set of new columns
+                        // build external table; check for new columns
                         command = new SqlCommand("uspBuildExternalTable", sqlCon);
                         command.CommandType = CommandType.StoredProcedure;
                         command.Parameters.Add(new SqlParameter("@tableName", tableName));
                         command.Parameters.Add(new SqlParameter("@columns", columns));
                         command.Parameters.Add(new SqlParameter("@blobDirectory", blobDirectory));
                         command.Parameters.Add(new SqlParameter("@rejectCount", blobCountAsString));
-                        dt.Load(command.ExecuteReader());
+                        command.Parameters.Add(new SqlParameter("@newColumnsExist", newColumnsExist)).Direction =
+                            ParameterDirection.Output;
+                        command.ExecuteNonQuery();
+                        newColumnsExist = Convert.ToInt32(command.Parameters["@newColumnsExist"].Value.ToString());
 
-                        if(dt != null)
+                        if (newColumnsExist == 1)
                         {
+                            DataTable dt = new DataTable();
                             string columnString = "";
+
+                            command = new SqlCommand("uspGetExternalTableColumns", sqlCon);
+                            command.CommandType = CommandType.StoredProcedure;
+                            command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                            dt.Load(command.ExecuteReader());
+
                             // build and format column list for add cols proc
                             foreach(DataRow dr in dt.Rows)
                             {
                                 if (dr["IsExisting"].ToString() == "1")
                                     columnString += "," + dr["ColumnName"].ToString();
                                 else
-                                    columnString += ",null as " + dr["ColumnName"].ToString();
+                                    columnString += ",cast(null as varchar(200)) as " + dr["ColumnName"].ToString();
                             }
 
                             // trim first comma
@@ -319,6 +327,7 @@ namespace IntelligentClarizenLoad
                             command.CommandType = CommandType.StoredProcedure;
                             command.Parameters.Add(new SqlParameter("@tableName", tableName));
                             command.Parameters.Add(new SqlParameter("@columnString", columnString));
+                            command.CommandTimeout = 1200;
                             command.ExecuteNonQuery();
                         }
 
@@ -326,6 +335,7 @@ namespace IntelligentClarizenLoad
                         command = new SqlCommand("uspIncrementalClarizenTableLoad", sqlCon);
                         command.CommandType = CommandType.StoredProcedure;
                         command.Parameters.Add(new SqlParameter("@tableName", tableName));
+                        command.CommandTimeout = 1200;
                         command.ExecuteNonQuery();
 
                     }
